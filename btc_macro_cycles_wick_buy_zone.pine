@@ -1,0 +1,197 @@
+//@version=5
+indicator("BTC Macro Cycles + Wick Buy Zone (v3.1, Pine-clean FULL)", overlay=true, max_labels_count=300)
+
+//========================
+// Inputs
+//========================
+src = input.source(close, "Quelle")
+
+// MA
+maLen  = input.int(200, "MA Periode", minval=1)
+maType = input.string("SMA", "MA Typ", options=["SMA","EMA"])
+
+// Regime-Filter (wenige Makro-Zyklen)
+minSlopePct  = input.float(0.10, "Min MA-Slope %/Bar", minval=0.0, step=0.01)
+persistBars  = input.int(8, "Persistenz (Bars am Stück)", minval=1)
+priceBuffer  = input.float(2.0, "Preis-Puffer % (Hysterese)", minval=0.0, step=0.1)
+
+// Zones (wick-basiert für Kauf/Übertreibung)
+showZones = input.bool(true, "Zonen anzeigen")
+zoneMode  = input.string("Percent", "Zone-Modus", options=["Percent","ATR","Off"])
+zonePctLo = input.float(25.0, "Buy-Zone unter MA (%)", minval=0.1, step=0.1)
+zonePctHi = input.float(20.0, "Sell-Zone über MA (%)", minval=0.1, step=0.1)
+atrLen    = input.int(14, "ATR Length", minval=1)
+atrMultLo = input.float(3.0, "ATR Mult Buy", minval=0.1, step=0.1)
+atrMultHi = input.float(3.0, "ATR Mult Sell", minval=0.1, step=0.1)
+
+// Visuals
+showBg           = input.bool(true, "Hintergrund Bull/Bear")
+showSwitchLabels = input.bool(false, "Labels bei Regime-Wechsel")
+showBuyMarks     = input.bool(true, "BUY Marker bei Wick in Buy-Zone")
+showSellMarks    = input.bool(false, "SELL Marker bei Wick in Sell-Zone")
+showHUD          = input.bool(true, "HUD (Regime-Label rechts)")
+
+colMA     = input.color(color.new(color.orange, 0), "MA Farbe")
+colBullBg = input.color(color.new(color.green, 90), "Bull Background")
+colBearBg = input.color(color.new(color.red, 90), "Bear Background")
+colBuy    = input.color(color.new(color.lime, 0), "Buy Zone Farbe")
+colSell   = input.color(color.new(color.red, 0), "Sell Zone Farbe")
+
+//========================
+// Helpers
+//========================
+f_ma(_src, _len, _type) =>
+    _type == "EMA" ? ta.ema(_src, _len) : ta.sma(_src, _len)
+
+secPerBar = timeframe.in_seconds(timeframe.period)
+daysFromBars(_bars) => (_bars * secPerBar) / 86400.0
+
+//========================
+// MA + Slope
+//========================
+ma = f_ma(src, maLen, maType)
+slopePct = ma[1] != 0.0 ? ((ma - ma[1]) / ma[1]) * 100.0 : 0.0
+
+//========================
+// Zones (asymmetrisch + wick-friendly)
+//========================
+atr = ta.atr(atrLen)
+
+float lowerZone = na
+float upperZone = na
+
+if zoneMode == "Percent"
+    lowerZone := ma * (1.0 - zonePctLo / 100.0)
+    upperZone := ma * (1.0 + zonePctHi / 100.0)
+else if zoneMode == "ATR"
+    lowerZone := ma - atrMultLo * atr
+    upperZone := ma + atrMultHi * atr
+else
+    lowerZone := na
+    upperZone := na
+
+zonesOn = showZones and (zoneMode != "Off")
+
+//========================
+// Regime detection (Makro, stabil)
+//========================
+bullCandidate = (close > ma * (1.0 + priceBuffer / 100.0)) and (slopePct >= minSlopePct)
+bearCandidate = (close < ma * (1.0 - priceBuffer / 100.0)) and (slopePct <= -minSlopePct)
+
+bullOK = ta.barssince(not bullCandidate) >= (persistBars - 1)
+bearOK = ta.barssince(not bearCandidate) >= (persistBars - 1)
+
+// State: 1 bull, -1 bear, 0 neutral
+var int regime = 0
+if regime == 0
+    regime := bullOK ? 1 : bearOK ? -1 : 0
+else
+    if regime == 1 and bearOK
+        regime := -1
+    else if regime == -1 and bullOK
+        regime := 1
+    else
+        regime := regime
+
+isBull = regime == 1
+isBear = regime == -1
+
+// bgcolor MUST be global scope
+bgcolor(showBg ? (isBull ? colBullBg : isBear ? colBearBg : na) : na)
+
+//========================
+// Cycle tracking (Bull-Nummern + Dauer + Drawdown)
+//========================
+var int bullNum = 0
+var int bullStartBar = na
+var float bullPeak = na
+var int bearStartBar = na
+var float bearTrough = na
+
+// init
+var bool inited = false
+if not inited
+    inited := true
+    if isBull
+        bullNum := 1
+        bullStartBar := bar_index
+        bullPeak := high
+    else if isBear
+        bearStartBar := bar_index
+        bearTrough := low
+
+// update extremes
+if isBull
+    bullPeak := na(bullPeak) ? high : math.max(bullPeak, high)
+if isBear
+    bearTrough := na(bearTrough) ? low : math.min(bearTrough, low)
+
+// switches
+swBullToBear = isBear and (regime[1] == 1)
+swBearToBull = isBull and (regime[1] == -1)
+
+// Bull -> Bear
+if swBullToBear
+    bearStartBar := bar_index
+    bearTrough := low
+    if showSwitchLabels
+        bullDays = na(bullStartBar) ? na : daysFromBars(bar_index - bullStartBar)
+        txtA = "Bull #" + str.tostring(bullNum) + " → Bear" + (not na(bullDays) ? ("\nBull Tage: " + str.tostring(bullDays, "#.0")) : "")
+        label.new(bar_index, high, txtA, style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0))
+
+// Bear -> Bull (finalize bear + start new bull)
+var float lastDD = na
+var float lastBearDays = na
+
+if swBearToBull
+    lastBearDays := na(bearStartBar) ? na : daysFromBars(bar_index - bearStartBar)
+    lastDD := (not na(bullPeak) and not na(bearTrough) and bullPeak > 0.0) ? ((bearTrough - bullPeak) / bullPeak) * 100.0 : na
+
+    bullNum += 1
+    bullStartBar := bar_index
+    bullPeak := high
+
+    if showSwitchLabels
+        txtB = "Bear → Bull #" + str.tostring(bullNum) +
+               (not na(lastBearDays) ? ("\nBear Tage: " + str.tostring(lastBearDays, "#.0")) : "") +
+               (not na(lastDD) ? ("\nDD: " + str.tostring(lastDD, "#.1") + "%") : "")
+        label.new(bar_index, low, txtB, style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0))
+
+//========================
+// Wick-based Buy/Sell markers
+//========================
+buyTouch  = zonesOn and isBear and (low <= lowerZone)
+sellTouch = zonesOn and isBull and (high >= upperZone)
+
+plotshape(showBuyMarks and buyTouch, title="BUY zone wick", style=shape.triangleup, size=size.tiny, location=location.belowbar, color=color.new(colBuy, 0), text="BUY")
+plotshape(showSellMarks and sellTouch, title="SELL zone wick", style=shape.triangledown, size=size.tiny, location=location.abovebar, color=color.new(colSell, 0), text="SELL")
+
+//========================
+// Plots (global scope)
+//========================
+plot(ma, "MA", linewidth=2, color=colMA)
+
+lowerPlot = zonesOn ? lowerZone : na
+upperPlot = zonesOn ? upperZone : na
+maFill    = zonesOn ? ma : na
+
+pL = plot(lowerPlot, "Buy Zone (Lower)", linewidth=1, color=colBuy)
+pU = plot(upperPlot, "Sell Zone (Upper)", linewidth=1, color=colSell)
+pM = plot(maFill, "MA (fill)", display=display.none)
+
+fill(pL, pM, color=color.new(colBuy, 92))
+fill(pM, pU, color=color.new(colSell, 93))
+
+//========================
+// HUD: Regime + BullNum (ein Label am letzten Bar)
+//========================
+var label hud = na
+if showHUD and barstate.islast
+    if not na(hud)
+        label.delete(hud)
+
+    regTxt = isBull ? "BULL" : isBear ? "BEAR" : "NEUTRAL"
+    hudTxt = "Regime: " + regTxt + "\nBull # " + str.tostring(bullNum)
+
+    // NOTE: one-line label.new to avoid line-continuation syntax issues
+    hud := label.new(bar_index, high, hudTxt, style=label.style_label_upper_left, textcolor=color.white, color=color.new(color.black, 0))
